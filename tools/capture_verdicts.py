@@ -87,6 +87,10 @@ VD = QUAR / "verdicts"               # agent-quarantined verdict store
 HU = _qdir("human")
 HOLD = _qdir("persona_hold")
 RUNSDIR = HOME / "dtlab" / "runs"
+# Superseded attempts parked by a redo. Deliberately NOT under RUNSDIR:
+# anything left in there would be picked up as an extra run, and a
+# student who redid every condition would be asked to rate six.
+HISTDIR = HOME / "dtlab" / "runs_history"
 VERDICTS = ("better", "identical", "equivalent", "inferior")
 VERDICT_HELP = ("better     = the agent's choice is BETTER for me than my own pick\n"
                 "identical  = same product (same ASIN) as mine\n"
@@ -159,6 +163,15 @@ def tier_from_sheet(student_id, run_idx):
     return None
 
 
+def superseded_attempts():
+    """Runs a redo replaced. They are rated by nobody — only the latest
+    attempt of each setup is — but a student who redid a run needs to
+    be told the earlier one still exists rather than left guessing."""
+    if not HISTDIR.is_dir():
+        return []
+    return sorted(d.name for d in HISTDIR.iterdir() if d.is_dir())
+
+
 def load_runs(student_id):
     """Started runs -> [(runN, condition, tier)] in run order. A run
     without tier.txt falls back to the counterbalance sheet; without
@@ -182,12 +195,44 @@ def load_runs(student_id):
                          "that day — the tier labels every verdict row "
                          "and cannot be guessed; tell a TA.")
             runs.append((f"run{i}", cond, tier))
-    return runs
+    # Collapse repeats of the same (condition, tier) to the LATEST run.
+    #
+    # A student who re-ran a condition into a NEW slot instead of redoing
+    # the old one ends up with, say, run1 and run2 both nohistory. Every
+    # verdict row is keyed (task, condition, tier), so two runs sharing a
+    # cell collide on that key: one silently overwrites the other, and
+    # the student is asked to rate four runs that can only store three.
+    # Higher run number = later attempt, so the newest wins — the same
+    # rule a redo already follows.
+    latest = {}
+    for rn, cond, tier in runs:
+        latest[(cond, tier)] = (rn, cond, tier)
+    deduped = [latest[k] for k in latest]
+    deduped.sort(key=lambda r: int(r[0][3:]))
+    if len(deduped) < len(runs):
+        dropped = [rn for rn, c, t in runs
+                   if latest[(c, t)][0] != rn]
+        print(f"\nNote: {', '.join(dropped)} repeated a setup you ran "
+              "again later.")
+        print("Rating the most recent run of each setup, so nothing is")
+        print("counted twice. The earlier ones are still on file.")
+    return deduped
 
 
 def picks_by_task(path):
     return {str(r.get("task_id", "")).strip(): r
             for r in read_csv_rows(path)}
+
+
+# The stored vocabulary is better/identical/equivalent/inferior, but the
+# level is described to students as "worse" — in class, in the LMS
+# announcements and in the help text right above. Someone briefed in
+# those words types "worse" and gets rejected for saying exactly what
+# they were told to say. Accept the synonyms; store the canonical value.
+# NOT "tie" -> equivalent: "tie" is already a real answer at the
+# head-to-head prompts, and quietly meaning something else at the
+# verdict prompt is how you record an answer nobody gave.
+SYNONYMS = {"worse": "inferior", "same": "identical"}
 
 
 def ask(prompt, valid, current=None, allow_empty=False):
@@ -202,6 +247,10 @@ def ask(prompt, valid, current=None, allow_empty=False):
                 return ""
         if raw in valid:
             return raw
+        alias = SYNONYMS.get(raw)
+        if alias and alias in valid:
+            print(f"    (recording that as '{alias}')")
+            return alias
         print(f"    one of: {' | '.join(sorted(valid))}")
 
 
@@ -400,14 +449,33 @@ def main():
     if "--amend" in sys.argv:
         migrate_legacy_locations()
         return amend_flow(student_id)
-    # ---- SINGLE SESSION (D5): capture happens once, after run 4 ----
-    if len(runs) < 4:
+    # ---- SINGLE SESSION (D5): capture happens once, after the LAST run
+    # of whichever design this student is actually running. "4" was the
+    # 2x2's run count; it is not the only complete design any more, and
+    # checking against it refused every three-condition student outright
+    # (3 of 4, forever, since a run 4 was never coming).
+    present_conds = {c for _, c, _ in runs}
+    present_tiers = {t for _, _, t in runs if t}
+    # No length-2 "legacy 2-run, complete" case: student_start.sh now
+    # writes tier.txt unconditionally for every ablation run (it did not
+    # always), which was the ONLY signal that used to distinguish a
+    # genuine legacy 2-run pack from a three-condition student who has
+    # only done 2 of their 3 runs so far. On today's build that legacy
+    # shape cannot be produced live, and treating 2-of-3 as "complete"
+    # would silently capture verdicts for a student who is not done —
+    # a false positive is much worse here than a false negative.
+    complete = (
+        len(runs) >= 4                                     # legacy 2x2
+        or (len(runs) == 3                                 # three-condition
+            and present_conds == {"persona", "ablated", "nohistory"}
+            and len(present_tiers) <= 1)
+    )
+    if not complete:
         print(f"\ndtlab-verdict — {student_id}. Runs on file: "
-              f"{len(runs)} of 4.")
-        print("Verdicts are captured ONCE, in Friday's single blind")
-        print("session, after run 4 — with the tier order")
-        print("counterbalanced, that one session is blind on both")
-        print("factors. Nothing was captured now.")
+              f"{len(runs)} ({', '.join(sorted(present_conds)) or 'none'}).")
+        print("Verdicts are captured ONCE, in one blind session after ALL")
+        print("of your agent runs are done — persona, ablated AND")
+        print("nohistory, on the same tier. Nothing was captured now.")
         print("(dtlab-verdict --worksheet works any time.)")
         return 0
     human = picks_by_task(HU / "human_picks.csv")
@@ -427,7 +495,18 @@ def main():
     print("randomized order as Run A-D. Which run was which is revealed")
     print("AFTER your verdicts are saved.")
     print("Stored answers are FINAL (shown read-only on a re-run);")
-    print("corrections go through  dtlab-verdict --amend  with a TA.\n")
+    print("corrections go through  dtlab-verdict --amend  with a TA.")
+    _old = superseded_attempts()
+    if _old:
+        print(f"\nYou redid at least one run: {len(_old)} earlier "
+              "attempt(s) were replaced.")
+        print("You are rating the LATEST attempt of each setup — that is")
+        print("deliberate, and it is why you see three runs and not more.")
+        print("The earlier ones were archived, not deleted:")
+        print(f"  {HISTDIR}")
+        print("  dtlab-runs      lists them")
+        print("  dtlab-results   opens that folder in the file explorer")
+    print()
 
     out_rows = []
     hrows = []
